@@ -35,24 +35,19 @@ for i = n, 1, -1 do
 
         if queue_index and port_id then
             local pfc_rx_pkt_key = 'SAI_PORT_STAT_PFC_' .. queue_index .. '_RX_PKTS'
-            local pfc_on2off_key = 'SAI_PORT_STAT_PFC_' .. queue_index .. '_ON2OFF_RX_PKTS'
 
             -- Get all counters
             local occupancy_bytes = redis.call('HGET', counters_table_name .. ':' .. KEYS[i], 'SAI_QUEUE_STAT_CURR_OCCUPANCY_BYTES')
             local packets = redis.call('HGET', counters_table_name .. ':' .. KEYS[i], 'SAI_QUEUE_STAT_PACKETS')
             local pfc_rx_packets = redis.call('HGET', counters_table_name .. ':' .. port_id, pfc_rx_pkt_key)
-            local pfc_on2off = redis.call('HGET', counters_table_name .. ':' .. port_id, pfc_on2off_key)
-            local queue_pause_status = redis.call('HGET', counters_table_name .. ':' .. KEYS[i], 'SAI_QUEUE_ATTR_PAUSE_STATUS')
 
-            if occupancy_bytes and packets and pfc_rx_packets and pfc_on2off and queue_pause_status then
+            if occupancy_bytes and packets and pfc_rx_packets then
                 occupancy_bytes = tonumber(occupancy_bytes)
                 packets = tonumber(packets)
                 pfc_rx_packets = tonumber(pfc_rx_packets)
-                pfc_on2off = tonumber(pfc_on2off)
 
                 local packets_last = redis.call('HGET', counters_table_name .. ':' .. KEYS[i], 'SAI_QUEUE_STAT_PACKETS_last')
                 local pfc_rx_packets_last = redis.call('HGET', counters_table_name .. ':' .. port_id, pfc_rx_pkt_key .. '_last')
-                local pfc_on2off_last = redis.call('HGET', counters_table_name .. ':' .. port_id, pfc_on2off_key .. '_last')
                 local queue_pause_status_last = redis.call('HGET', counters_table_name .. ':' .. KEYS[i], 'SAI_QUEUE_ATTR_PAUSE_STATUS_last')
 
                 -- DEBUG CODE START. Uncomment to enable
@@ -60,33 +55,34 @@ for i = n, 1, -1 do
                 -- DEBUG CODE END.
 
                 -- If this is not a first run, then we have last values available
-                if packets_last and pfc_rx_packets_last and pfc_on2off_last and queue_pause_status_last then
+                if packets_last and pfc_rx_packets_last then
                     packets_last = tonumber(packets_last)
                     pfc_rx_packets_last = tonumber(pfc_rx_packets_last)
-                    pfc_on2off_last = tonumber(pfc_on2off_last)
 
                     -- Check actual condition of queue exiting PFC storm (despite XON packet flooding)
-                    if (pfc_rx_packets - pfc_rx_packets_last == 0) or (math.abs(packets - packets_last) > 0) or (occupancy_bytes == 0) then
-                        
-
-                if (queue_pause_status == 'false')
-                -- DEBUG CODE START. Uncomment to enable
-                and (debug_storm ~= "enabled")
-                -- DEBUG CODE END.
-                then
-                    if time_left <= poll_time then
-                        redis.call('PUBLISH', 'PFC_WD_ACTION', '["' .. KEYS[i] .. '","restore"]')
-                        time_left = restoration_time
+                    if ((pfc_rx_packets - pfc_rx_packets_last == 0)
+                        or (packets - packets_last > 0)
+                        or (occupancy_bytes == 0))
+                        and (debug_storm ~= "enabled")
+                    then
+                        if time_left <= poll_time then
+                            redis.call('PUBLISH', 'PFC_WD_ACTION', '["' .. KEYS[i] .. '","restore"]')
+                            time_left = restoration_time
+                        else
+                            time_left = time_left - poll_time
+                        end
                     else
-                        time_left = time_left - poll_time
+                        time_left = restoration_time
                     end
-                else
-                    time_left = restoration_time
                 end
 
-            -- Save values for next run
-            redis.call('HSET', counters_table_name .. ':' .. KEYS[i], 'PFC_WD_RESTORATION_TIME_LEFT', time_left)
+                -- Save values for next run
+                redis.call('HSET', counters_table_name .. ':' .. KEYS[i], 'PFC_WD_RESTORATION_TIME_LEFT', time_left)
+                redis.call('HSET', counters_table_name .. ':' .. KEYS[i], 'SAI_QUEUE_STAT_PACKETS_last', packets)
+                redis.call('HSET', counters_table_name .. ':' .. port_id, pfc_rx_pkt_key .. '_last', pfc_rx_packets)
+            end
         end
+    end
 end
 
 return rets
