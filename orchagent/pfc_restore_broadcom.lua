@@ -66,7 +66,8 @@ for i = n, 1, -1 do
                     pfc_on2off_last = tonumber(pfc_on2off_last)
 
                     -- Check actual condition of queue exiting PFC storm (despite XON packet flooding)
-                    if (pfc_rx_packets - pfc_rx_packets_last == 0 or queue_pause_status == 'false' or )
+                    if (pfc_rx_packets - pfc_rx_packets_last == 0) or (math.abs(packets - packets_last) > 0) or (occupancy_bytes == 0) then
+                        
 
                 if (queue_pause_status == 'false')
                 -- DEBUG CODE START. Uncomment to enable
