@@ -61,8 +61,7 @@ for i = n, 1, -1 do
 
                     -- Check actual condition of queue exiting PFC storm (despite XON packet flooding)
                     if ((pfc_rx_packets - pfc_rx_packets_last == 0)
-                        or (packets - packets_last > 0)
-                        or (occupancy_bytes == 0))
+                        or (packets - packets_last > 0))
                         and (debug_storm ~= "enabled")
                     then
                         if time_left <= poll_time then
