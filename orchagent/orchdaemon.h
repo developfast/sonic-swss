@@ -46,6 +46,8 @@
 #include "bfdorch.h"
 #include "srv6orch.h"
 #include "nvgreorch.h"
+#include "twamporch.h"
+#include "stporch.h"
 #include "dash/dashaclorch.h"
 #include "dash/dashorch.h"
 #include "dash/dashrouteorch.h"
@@ -61,7 +63,7 @@ public:
     ~OrchDaemon();
 
     virtual bool init();
-    void start();
+    void start(long heartBeatInterval);
     bool warmRestoreAndSyncUp();
     void getTaskToSync(vector<string> &ts);
     bool warmRestoreValidation();
@@ -100,7 +102,9 @@ private:
 
     void flush();
 
-    void heartBeat(std::chrono::time_point<std::chrono::high_resolution_clock> tcurrent);
+    void heartBeat(std::chrono::time_point<std::chrono::high_resolution_clock> tcurrent, long interval);
+
+    void freezeAndHeartBeat(unsigned int duration, long interval);
 };
 
 class FabricOrchDaemon : public OrchDaemon

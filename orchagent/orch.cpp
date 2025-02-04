@@ -30,6 +30,20 @@ Orch::Orch(DBConnector *db, const vector<string> &tableNames)
     }
 }
 
+Orch::Orch(swss::DBConnector *db1, swss::DBConnector *db2, 
+    const std::vector<std::string> &tableNames_1, const std::vector<std::string> &tableNames_2)
+{
+    for(auto it : tableNames_1)
+    {
+        addConsumer(db1, it, default_orch_pri);
+    }
+
+    for(auto it : tableNames_2)
+    {
+        addConsumer(db2, it, default_orch_pri);
+    }
+}
+
 Orch::Orch(DBConnector *db, const vector<table_name_with_pri_t> &tableNames_with_pri)
 {
     for (const auto& it : tableNames_with_pri)
@@ -156,7 +170,7 @@ size_t ConsumerBase::addToSync(const std::deque<KeyOpFieldsValuesTuple> &entries
 }
 
 // TODO: Table should be const
-size_t Consumer::refillToSync(Table* table)
+size_t ConsumerBase::refillToSync(Table* table)
 {
     std::deque<KeyOpFieldsValuesTuple> entries;
     vector<string> keys;
@@ -178,7 +192,7 @@ size_t Consumer::refillToSync(Table* table)
     return addToSync(entries);
 }
 
-size_t Consumer::refillToSync()
+size_t ConsumerBase::refillToSync()
 {
     auto subTable = dynamic_cast<SubscriberStateTable *>(getSelectable());
     if (subTable != NULL)
@@ -194,14 +208,23 @@ size_t Consumer::refillToSync()
         } while (update_size != 0);
         return total_size;
     }
-    else
+    string tableName = getTableName();
+    auto consumerTable = dynamic_cast<ConsumerTableBase *>(getSelectable());
+    if (consumerTable != NULL)
     {
         // consumerTable is either ConsumerStateTable or ConsumerTable
-        auto db = getDbConnector();
-        string tableName = getTableName();
+        auto db = consumerTable->getDbConnector();
         auto table = Table(db, tableName);
         return refillToSync(&table);
     }
+    auto zmqTable = dynamic_cast<ZmqConsumerStateTable *>(getSelectable());
+    if (zmqTable != NULL)
+    {
+        auto db = zmqTable->getDbConnector();
+        auto table = Table(db, tableName);
+        return refillToSync(&table);
+    }
+    return 0;
 }
 
 string ConsumerBase::dumpTuple(const KeyOpFieldsValuesTuple &tuple)
@@ -233,14 +256,12 @@ void Consumer::execute()
     // ConsumerBase::execute_impl<swss::ConsumerTableBase>();
     SWSS_LOG_ENTER();
 
-    size_t update_size = 0;
     auto table = static_cast<swss::ConsumerTableBase *>(getSelectable());
-    do
-    {
-        std::deque<KeyOpFieldsValuesTuple> entries;
-        table->pops(entries);
-        update_size = addToSync(entries);
-    } while (update_size != 0);
+    std::deque<KeyOpFieldsValuesTuple> entries;
+    table->pops(entries);
+
+    // add to sync
+    addToSync(entries);
 
     drain();
 }
@@ -253,7 +274,7 @@ void Consumer::drain()
 
 size_t Orch::addExistingData(const string& tableName)
 {
-    auto consumer = dynamic_cast<Consumer *>(getExecutor(tableName));
+    auto consumer = dynamic_cast<ConsumerBase *>(getExecutor(tableName));
     if (consumer == NULL)
     {
         SWSS_LOG_ERROR("No consumer %s in Orch", tableName.c_str());
@@ -267,7 +288,7 @@ size_t Orch::addExistingData(const string& tableName)
 size_t Orch::addExistingData(Table *table)
 {
     string tableName = table->getTableName();
-    Consumer* consumer = dynamic_cast<Consumer *>(getExecutor(tableName));
+    ConsumerBase* consumer = dynamic_cast<ConsumerBase *>(getExecutor(tableName));
     if (consumer == NULL)
     {
         SWSS_LOG_ERROR("No consumer %s in Orch", tableName.c_str());
@@ -285,7 +306,7 @@ bool Orch::bake()
     {
         string executorName = it.first;
         auto executor = it.second;
-        auto consumer = dynamic_cast<Consumer *>(executor.get());
+        auto consumer = dynamic_cast<ConsumerBase *>(executor.get());
         if (consumer == NULL)
         {
             continue;
@@ -537,7 +558,7 @@ void Orch::dumpPendingTasks(vector<string> &ts)
 {
     for (auto &it : m_consumerMap)
     {
-        Consumer* consumer = dynamic_cast<Consumer *>(it.second.get());
+        ConsumerBase* consumer = dynamic_cast<ConsumerBase *>(it.second.get());
         if (consumer == NULL)
         {
             SWSS_LOG_DEBUG("Executor is not a Consumer");
@@ -688,7 +709,7 @@ set<string> Orch::generateIdListFromMap(unsigned long idsMap, sai_uint32_t maxId
 {
     unsigned long currentIdMask = 1;
     bool started = false, needGenerateMap = false;
-    sai_uint32_t lower, upper;
+    sai_uint32_t lower = 0, upper = 0;
     set<string> idStringList;
     for (sai_uint32_t id = 0; id <= maxId; id ++)
     {
@@ -838,19 +859,19 @@ void Orch2::doTask(Consumer &consumer)
         }
         catch (const std::invalid_argument& e)
         {
-            SWSS_LOG_ERROR("Parse error: %s", e.what());
+            SWSS_LOG_ERROR("Parse error in %s: %s", typeid(*this).name(), e.what());
         }
         catch (const std::logic_error& e)
         {
-            SWSS_LOG_ERROR("Logic error: %s", e.what());
+            SWSS_LOG_ERROR("Logic error in %s: %s", typeid(*this).name(), e.what());
         }
         catch (const std::exception& e)
         {
-            SWSS_LOG_ERROR("Exception was catched in the request parser: %s", e.what());
+            SWSS_LOG_ERROR("Exception was caught in the request parser in %s: %s", typeid(*this).name(), e.what());
         }
         catch (...)
         {
-            SWSS_LOG_ERROR("Unknown exception was catched in the request parser");
+            SWSS_LOG_ERROR("Unknown exception was caught in the request parser");
         }
         request_.clear();
 

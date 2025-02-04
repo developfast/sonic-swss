@@ -23,9 +23,6 @@ extern string gMySwitchType;
 extern string gMyHostName;
 extern string gMyAsicName;
 
-#define BUFFER_POOL_WATERMARK_FLEX_STAT_COUNTER_POLL_MSECS  "60000"
-
-
 static const vector<sai_buffer_pool_stat_t> bufferPoolWatermarkStatIds =
 {
     SAI_BUFFER_POOL_STAT_WATERMARK_BYTES,
@@ -52,9 +49,6 @@ std::map<string, std::map<size_t, string>> queue_port_flags;
 
 BufferOrch::BufferOrch(DBConnector *applDb, DBConnector *confDb, DBConnector *stateDb, vector<string> &tableNames) :
     Orch(applDb, tableNames),
-    m_flexCounterDb(new DBConnector("FLEX_COUNTER_DB", 0)),
-    m_flexCounterTable(new ProducerTable(m_flexCounterDb.get(), FLEX_COUNTER_TABLE)),
-    m_flexCounterGroupTable(new ProducerTable(m_flexCounterDb.get(), FLEX_COUNTER_GROUP_TABLE)),
     m_countersDb(new DBConnector("COUNTERS_DB", 0)),
     m_stateBufferMaximumValueTable(stateDb, STATE_BUFFER_MAXIMUM_VALUE_TABLE)
 {
@@ -229,22 +223,23 @@ void BufferOrch::initBufferConstants()
 void BufferOrch::initFlexCounterGroupTable(void)
 {
     string bufferPoolWmPluginName = "watermark_bufferpool.lua";
+    string bufferPoolWmSha;
 
     try
     {
         string bufferPoolLuaScript = swss::loadLuaScript(bufferPoolWmPluginName);
-        string bufferPoolWmSha = swss::loadRedisScript(m_countersDb.get(), bufferPoolLuaScript);
-
-        vector<FieldValueTuple> fvTuples;
-        fvTuples.emplace_back(BUFFER_POOL_PLUGIN_FIELD, bufferPoolWmSha);
-        fvTuples.emplace_back(POLL_INTERVAL_FIELD, BUFFER_POOL_WATERMARK_FLEX_STAT_COUNTER_POLL_MSECS);
-
-        m_flexCounterGroupTable->set(BUFFER_POOL_WATERMARK_STAT_COUNTER_FLEX_COUNTER_GROUP, fvTuples);
+        bufferPoolWmSha = swss::loadRedisScript(m_countersDb.get(), bufferPoolLuaScript);
     }
     catch (const runtime_error &e)
     {
         SWSS_LOG_ERROR("Buffer pool watermark lua script and/or flex counter group not set successfully. Runtime error: %s", e.what());
     }
+
+    setFlexCounterGroupParameter(BUFFER_POOL_WATERMARK_STAT_COUNTER_FLEX_COUNTER_GROUP,
+                                 BUFFER_POOL_WATERMARK_FLEX_STAT_COUNTER_POLL_MSECS,
+                                 "", // do not touch stats_mode
+                                 BUFFER_POOL_PLUGIN_FIELD,
+                                 bufferPoolWmSha);
 }
 
 bool BufferOrch::isPortReady(const std::string& port_name) const
@@ -275,7 +270,7 @@ void BufferOrch::clearBufferPoolWatermarkCounterIdList(const sai_object_id_t obj
     if (m_isBufferPoolWatermarkCounterIdListGenerated)
     {
         string key = BUFFER_POOL_WATERMARK_STAT_COUNTER_FLEX_COUNTER_GROUP ":" + sai_serialize_object_id(object_id);
-        m_flexCounterTable->del(key);
+        stopFlexCounterPolling(gSwitchId, key);
     }
 }
 
@@ -326,37 +321,32 @@ void BufferOrch::generateBufferPoolWatermarkCounterIdList(void)
 
     if (!noWmClrCapability)
     {
-        vector<FieldValueTuple> fvs;
-
-        fvs.emplace_back(STATS_MODE_FIELD, STATS_MODE_READ_AND_CLEAR);
-        m_flexCounterGroupTable->set(BUFFER_POOL_WATERMARK_STAT_COUNTER_FLEX_COUNTER_GROUP, fvs);
+        setFlexCounterGroupStatsMode(BUFFER_POOL_WATERMARK_STAT_COUNTER_FLEX_COUNTER_GROUP,
+                                     STATS_MODE_READ_AND_CLEAR);
     }
 
     // Push buffer pool watermark COUNTER_ID_LIST to FLEX_COUNTER_TABLE on a per buffer pool basis
-    vector<FieldValueTuple> fvTuples;
-    fvTuples.emplace_back(BUFFER_POOL_COUNTER_ID_LIST, statList);
+    string stats_mode;
+
     bitMask = 1;
+
     for (const auto &it : *(m_buffer_type_maps[APP_BUFFER_POOL_TABLE_NAME]))
     {
         string key = BUFFER_POOL_WATERMARK_STAT_COUNTER_FLEX_COUNTER_GROUP ":" + sai_serialize_object_id(it.second.m_saiObjectId);
 
+        stats_mode = "";
+
         if (noWmClrCapability)
         {
-            string stats_mode = STATS_MODE_READ_AND_CLEAR;
             if (noWmClrCapability & bitMask)
             {
                 stats_mode = STATS_MODE_READ;
             }
-            fvTuples.emplace_back(STATS_MODE_FIELD, stats_mode);
 
-            m_flexCounterTable->set(key, fvTuples);
-            fvTuples.pop_back();
             bitMask <<= 1;
         }
-        else
-        {
-            m_flexCounterTable->set(key, fvTuples);
-        }
+
+        startFlexCounterPolling(gSwitchId, key, statList, BUFFER_POOL_COUNTER_ID_LIST, stats_mode);
     }
 
     m_isBufferPoolWatermarkCounterIdListGenerated = true;
@@ -368,6 +358,25 @@ const object_reference_map &BufferOrch::getBufferPoolNameOidMap(void)
     // different threads, caller may need to grab a read lock
     // before calling this function
     return *m_buffer_type_maps[APP_BUFFER_POOL_TABLE_NAME];
+}
+
+void BufferOrch::getBufferObjectsWithNonZeroProfile(vector<string> &nonZeroQueues, const string &table)
+{
+    for (auto &&queueRef: (*m_buffer_type_maps[table]))
+    {
+        for (auto &&profileRef: queueRef.second.m_objsReferencingByMe)
+        {
+            if (profileRef.second.find("_zero_") == std::string::npos)
+            {
+                SWSS_LOG_INFO("Selected key %s with profile %s", queueRef.first.c_str(), profileRef.second.c_str());
+                nonZeroQueues.push_back(queueRef.first);
+            }
+            else
+            {
+                SWSS_LOG_INFO("Skipped key %s with profile %s", queueRef.first.c_str(), profileRef.second.c_str());
+            }
+        }
+    }
 }
 
 task_process_status BufferOrch::processBufferPool(KeyOpFieldsValuesTuple &tuple)
@@ -704,6 +713,7 @@ task_process_status BufferOrch::processBufferProfile(KeyOpFieldsValuesTuple &tup
         }
         if (SAI_NULL_OBJECT_ID != sai_object)
         {
+            vector<sai_attribute_t> attribs_to_retry;
             SWSS_LOG_DEBUG("Modifying existing sai object:%" PRIx64, sai_object);
             for (auto &attribute : attribs)
             {
@@ -715,7 +725,18 @@ task_process_status BufferOrch::processBufferProfile(KeyOpFieldsValuesTuple &tup
                 }
                 else if (SAI_STATUS_SUCCESS != sai_status)
                 {
-                    SWSS_LOG_ERROR("Failed to modify buffer profile, name:%s, sai object:%" PRIx64 ", status:%d", object_name.c_str(), sai_object, sai_status);
+                    SWSS_LOG_NOTICE("Unable to modify buffer profile, name:%s, sai object:%" PRIx64 ", status:%d, will retry one more time", object_name.c_str(), sai_object, sai_status);
+                    attribs_to_retry.push_back(attribute);
+                }
+            }
+
+            for (auto &attribute : attribs)
+            {
+                sai_status = sai_buffer_api->set_buffer_profile_attribute(sai_object, &attribute);
+                if (SAI_STATUS_SUCCESS != sai_status)
+                {
+                    // A retried attribute can not be "not implemented"
+                    SWSS_LOG_ERROR("Failed to modify buffer profile, name:%s, sai object:%" PRIx64 ", status:%d, will retry once", object_name.c_str(), sai_object, sai_status);
                     task_process_status handle_status = handleSaiSetStatus(SAI_API_BUFFER, sai_status);
                     if (handle_status != task_process_status::task_success)
                     {
@@ -795,6 +816,9 @@ task_process_status BufferOrch::processQueue(KeyOpFieldsValuesTuple &tuple)
     sai_uint32_t range_low, range_high;
     bool need_update_sai = true;
     bool local_port = false;
+    bool counter_was_added = false;
+    bool counter_needs_to_add = false;
+    string old_buffer_profile_name;
     string local_port_name;
 
     SWSS_LOG_DEBUG("Processing:%s", key.c_str());
@@ -815,7 +839,7 @@ task_process_status BufferOrch::processQueue(KeyOpFieldsValuesTuple &tuple)
             return task_process_status::task_invalid_entry;
         }
 
-        if(tokens[0] == gMyHostName)
+        if((tokens[0] == gMyHostName) && (tokens[1] == gMyAsicName))
         {
            local_port = true;
            local_port_name = tokens[2];
@@ -854,7 +878,6 @@ task_process_status BufferOrch::processQueue(KeyOpFieldsValuesTuple &tuple)
             return task_process_status::task_failed;
         }
 
-        string old_buffer_profile_name;
         if (doesObjectExist(m_buffer_type_maps, APP_BUFFER_QUEUE_TABLE_NAME, key, buffer_profile_field_name, old_buffer_profile_name)
             && (old_buffer_profile_name == buffer_profile_name))
         {
@@ -872,11 +895,14 @@ task_process_status BufferOrch::processQueue(KeyOpFieldsValuesTuple &tuple)
         SWSS_LOG_NOTICE("Set buffer queue %s to %s", key.c_str(), buffer_profile_name.c_str());
 
         setObjectReference(m_buffer_type_maps, APP_BUFFER_QUEUE_TABLE_NAME, key, buffer_profile_field_name, buffer_profile_name);
+
+        // Counter operation
+        counter_needs_to_add = buffer_profile_name.find("_zero_") == std::string::npos;
+        SWSS_LOG_INFO("%s to create counter for %s with new profile %s", counter_needs_to_add ? "Need" : "No need", key.c_str(), buffer_profile_name.c_str());
     }
     else if (op == DEL_COMMAND)
     {
-        auto &typemap = (*m_buffer_type_maps[APP_BUFFER_QUEUE_TABLE_NAME]);
-        if (typemap.find(key) == typemap.end())
+        if (!doesObjectExist(m_buffer_type_maps, APP_BUFFER_QUEUE_TABLE_NAME, key, buffer_profile_field_name, old_buffer_profile_name))
         {
             SWSS_LOG_INFO("%s doesn't not exist, don't need to notfiy SAI", key.c_str());
             need_update_sai = false;
@@ -885,12 +911,16 @@ task_process_status BufferOrch::processQueue(KeyOpFieldsValuesTuple &tuple)
         SWSS_LOG_NOTICE("Remove buffer queue %s", key.c_str());
         removeObject(m_buffer_type_maps, APP_BUFFER_QUEUE_TABLE_NAME, key);
         m_partiallyAppliedQueues.erase(key);
+        counter_needs_to_add = false;
     }
     else
     {
         SWSS_LOG_ERROR("Unknown operation type %s", op.c_str());
         return task_process_status::task_invalid_entry;
     }
+
+    counter_was_added = !old_buffer_profile_name.empty() && old_buffer_profile_name.find("_zero_") == std::string::npos;
+    SWSS_LOG_INFO("%s to remove counter for %s with old profile %s", counter_was_added ? "Need" : "No need", key.c_str(), old_buffer_profile_name.c_str());
 
     sai_attribute_t attr;
     attr.id = SAI_QUEUE_ATTR_BUFFER_PROFILE_ID;
@@ -954,19 +984,23 @@ task_process_status BufferOrch::processQueue(KeyOpFieldsValuesTuple &tuple)
                         return handle_status;
                     }
                 }
-                // create/remove a port queue counter for the queue buffer
-                else
+                // create/remove a port queue counter for the queue buffer.
+                // For VOQ chassis, flexcounterorch adds the Queue Counters for all egress and VOQ queues of all front panel and system ports
+                // to  the FLEX_COUNTER_DB irrespective of BUFFER_QUEUE configuration. So Port Queue counter needs to be updated only for non VOQ switch.
+                else if (gMySwitchType != "voq")
                 {
                     auto flexCounterOrch = gDirectory.get<FlexCounterOrch*>();
                     auto queues = tokens[1];
-                    if (op == SET_COMMAND &&
+                    if (!counter_was_added && counter_needs_to_add &&
                         (flexCounterOrch->getQueueCountersState() || flexCounterOrch->getQueueWatermarkCountersState()))
                     {
+                        SWSS_LOG_INFO("Creating counters for %s %zd", port_name.c_str(), ind);
                         gPortsOrch->createPortBufferQueueCounters(port, queues);
                     }
-                    else if (op == DEL_COMMAND &&
+                    else if (counter_was_added && !counter_needs_to_add &&
                              (flexCounterOrch->getQueueCountersState() || flexCounterOrch->getQueueWatermarkCountersState()))
                     {
+                        SWSS_LOG_INFO("Removing counters for %s %zd", port_name.c_str(), ind);
                         gPortsOrch->removePortBufferQueueCounters(port, queues);
                     }
                 }
@@ -1053,6 +1087,9 @@ task_process_status BufferOrch::processPriorityGroup(KeyOpFieldsValuesTuple &tup
     vector<string> tokens;
     sai_uint32_t range_low, range_high;
     bool need_update_sai = true;
+    bool counter_was_added = false;
+    bool counter_needs_to_add = false;
+    string old_buffer_profile_name;
 
     SWSS_LOG_DEBUG("processing:%s", key.c_str());
     tokens = tokenize(key, delimiter);
@@ -1085,7 +1122,6 @@ task_process_status BufferOrch::processPriorityGroup(KeyOpFieldsValuesTuple &tup
             return task_process_status::task_failed;
         }
 
-        string old_buffer_profile_name;
         if (doesObjectExist(m_buffer_type_maps, APP_BUFFER_PG_TABLE_NAME, key, buffer_profile_field_name, old_buffer_profile_name)
             && (old_buffer_profile_name == buffer_profile_name))
         {
@@ -1096,11 +1132,14 @@ task_process_status BufferOrch::processPriorityGroup(KeyOpFieldsValuesTuple &tup
         SWSS_LOG_NOTICE("Set buffer PG %s to %s", key.c_str(), buffer_profile_name.c_str());
 
         setObjectReference(m_buffer_type_maps, APP_BUFFER_PG_TABLE_NAME, key, buffer_profile_field_name, buffer_profile_name);
+
+        // Counter operation
+        counter_needs_to_add = buffer_profile_name.find("_zero_") == std::string::npos;
+        SWSS_LOG_INFO("%s to create counter for priority group %s with new profile %s", counter_needs_to_add ? "Need" : "No need", key.c_str(), buffer_profile_name.c_str());
     }
     else if (op == DEL_COMMAND)
     {
-        auto &typemap = (*m_buffer_type_maps[APP_BUFFER_PG_TABLE_NAME]);
-        if (typemap.find(key) == typemap.end())
+        if (!doesObjectExist(m_buffer_type_maps, APP_BUFFER_PG_TABLE_NAME, key, buffer_profile_field_name, old_buffer_profile_name))
         {
             SWSS_LOG_INFO("%s doesn't not exist, don't need to notfiy SAI", key.c_str());
             need_update_sai = false;
@@ -1114,6 +1153,9 @@ task_process_status BufferOrch::processPriorityGroup(KeyOpFieldsValuesTuple &tup
         SWSS_LOG_ERROR("Unknown operation type %s", op.c_str());
         return task_process_status::task_invalid_entry;
     }
+
+    counter_was_added = !old_buffer_profile_name.empty() && old_buffer_profile_name.find("_zero_") == std::string::npos;
+    SWSS_LOG_INFO("%s to remove counter for priority group %s with old profile %s", counter_was_added ? "Need" : "No need", key.c_str(), old_buffer_profile_name.c_str());
 
     sai_attribute_t attr;
     attr.id = SAI_INGRESS_PRIORITY_GROUP_ATTR_BUFFER_PROFILE;
@@ -1157,14 +1199,16 @@ task_process_status BufferOrch::processPriorityGroup(KeyOpFieldsValuesTuple &tup
                     {
                         auto flexCounterOrch = gDirectory.get<FlexCounterOrch*>();
                         auto pgs = tokens[1];
-                        if (op == SET_COMMAND &&
+                        if (!counter_was_added && counter_needs_to_add &&
                             (flexCounterOrch->getPgCountersState() || flexCounterOrch->getPgWatermarkCountersState()))
                         {
+                            SWSS_LOG_INFO("Creating counters for priority group %s %zd", port_name.c_str(), ind);
                             gPortsOrch->createPortBufferPgCounters(port, pgs);
                         }
-                        else if (op == DEL_COMMAND &&
+                        else if (counter_was_added && !counter_needs_to_add &&
                                  (flexCounterOrch->getPgCountersState() || flexCounterOrch->getPgWatermarkCountersState()))
                         {
+                            SWSS_LOG_INFO("Removing counters for priority group %s %zd", port_name.c_str(), ind);
                             gPortsOrch->removePortBufferPgCounters(port, pgs);
                         }
                     }

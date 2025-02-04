@@ -96,6 +96,14 @@ static inline bool operator==(const sai_inseg_entry_t& a, const sai_inseg_entry_
         ;
 }
 
+static inline bool operator==(const sai_neighbor_entry_t& a, const sai_neighbor_entry_t& b)
+{
+    return a.switch_id == b.switch_id
+        && a.rif_id == b.rif_id
+        && a.ip_address == b.ip_address
+        ;
+}
+
 static inline bool operator==(const sai_inbound_routing_entry_t& a, const sai_inbound_routing_entry_t& b)
 {
     return a.switch_id == b.switch_id
@@ -126,7 +134,7 @@ static inline bool operator==(const sai_pa_validation_entry_t& a, const sai_pa_v
 static inline bool operator==(const sai_outbound_routing_entry_t& a, const sai_outbound_routing_entry_t& b)
 {
     return a.switch_id == b.switch_id
-        && a.eni_id == b.eni_id
+        && a.outbound_routing_group_id == b.outbound_routing_group_id
         && a.destination == b.destination
         ;
 }
@@ -204,6 +212,19 @@ namespace std
     };
 
     template <>
+    struct hash<sai_neighbor_entry_t>
+    {
+        size_t operator()(const sai_neighbor_entry_t& a) const noexcept
+        {
+            size_t seed = 0;
+            boost::hash_combine(seed, a.switch_id);
+            boost::hash_combine(seed, a.rif_id);
+            boost::hash_combine(seed, a.ip_address);
+            return seed;
+        }
+    };
+  
+    template <>
     struct hash<sai_outbound_ca_to_pa_entry_t>
     {
         size_t operator()(const sai_outbound_ca_to_pa_entry_t& a) const noexcept
@@ -236,7 +257,7 @@ namespace std
         {
             size_t seed = 0;
             boost::hash_combine(seed, a.switch_id);
-            boost::hash_combine(seed, a.eni_id);
+            boost::hash_combine(seed, a.outbound_routing_group_id);
             boost::hash_combine(seed, a.destination);
             return seed;
         }
@@ -322,6 +343,20 @@ struct SaiBulkerTraits<sai_next_hop_group_api_t>
 };
 
 template<>
+struct SaiBulkerTraits<sai_next_hop_api_t>
+{
+    using entry_t = sai_object_id_t;
+    using api_t = sai_next_hop_api_t;
+    using create_entry_fn = sai_create_next_hop_fn;
+    using remove_entry_fn = sai_remove_next_hop_fn;
+    using set_entry_attribute_fn = sai_set_next_hop_attribute_fn;
+    using bulk_create_entry_fn = sai_bulk_object_create_fn;
+    using bulk_remove_entry_fn = sai_bulk_object_remove_fn;
+    // TODO: wait until available in SAI
+    //using bulk_set_entry_attribute_fn = sai_bulk_object_set_attribute_fn;
+};
+
+template<>
 struct SaiBulkerTraits<sai_mpls_api_t>
 {
     using entry_t = sai_inseg_entry_t;
@@ -332,6 +367,19 @@ struct SaiBulkerTraits<sai_mpls_api_t>
     using bulk_create_entry_fn = sai_bulk_create_inseg_entry_fn;
     using bulk_remove_entry_fn = sai_bulk_remove_inseg_entry_fn;
     using bulk_set_entry_attribute_fn = sai_bulk_set_inseg_entry_attribute_fn;
+};
+
+template<>
+struct SaiBulkerTraits<sai_neighbor_api_t>
+{
+    using entry_t = sai_neighbor_entry_t;
+    using api_t = sai_neighbor_api_t;
+    using create_entry_fn = sai_create_neighbor_entry_fn;
+    using remove_entry_fn = sai_remove_neighbor_entry_fn;
+    using set_entry_attribute_fn = sai_set_neighbor_entry_attribute_fn;
+    using bulk_create_entry_fn = sai_bulk_create_neighbor_entry_fn;
+    using bulk_remove_entry_fn = sai_bulk_remove_neighbor_entry_fn;
+    using bulk_set_entry_attribute_fn = sai_bulk_set_neighbor_entry_attribute_fn;
 };
 
 template<>
@@ -812,6 +860,15 @@ inline EntityBulker<sai_mpls_api_t>::EntityBulker(sai_mpls_api_t *api, size_t ma
 }
 
 template <>
+inline EntityBulker<sai_neighbor_api_t>::EntityBulker(sai_neighbor_api_t *api, size_t max_bulk_size) :
+    max_bulk_size(max_bulk_size)
+{
+    create_entries = api->create_neighbor_entries;
+    remove_entries = api->remove_neighbor_entries;
+    set_entries_attribute = api->set_neighbor_entries_attribute;
+}
+
+template <>
 inline EntityBulker<sai_dash_inbound_routing_api_t>::EntityBulker(sai_dash_inbound_routing_api_t *api, size_t max_bulk_size) : max_bulk_size(max_bulk_size)
 {
     create_entries = api->create_inbound_routing_entries;
@@ -946,6 +1003,7 @@ public:
         // Creating
         if (!creating_entries.empty())
         {
+            create_statuses.clear();
             std::vector<sai_object_id_t *> rs;
             std::vector<sai_attribute_t const*> tss;
             std::vector<uint32_t> cs;
@@ -1023,6 +1081,10 @@ public:
         return removing_entries.size();
     }
 
+    sai_status_t create_status(sai_object_id_t object) {
+        return create_statuses[object];
+    }
+
 private:
     struct object_entry
     {
@@ -1061,6 +1123,8 @@ private:
     typename Ts::bulk_remove_entry_fn                       remove_entries;
     // TODO: wait until available in SAI
     //typename Ts::bulk_set_entry_attribute_fn                set_entries_attribute;
+
+    std::unordered_map<sai_object_id_t, sai_status_t>       create_statuses;
 
     sai_status_t flush_removing_entries(
         _Inout_ std::vector<sai_object_id_t> &rs)
@@ -1120,6 +1184,7 @@ private:
 
         for (size_t i = 0; i < count; i++)
         {
+            create_statuses.emplace(object_ids[i], statuses[i]);
             sai_object_id_t *pid = rs[i];
             *pid = (statuses[i] == SAI_STATUS_SUCCESS) ? object_ids[i] : SAI_NULL_OBJECT_ID;
         }
@@ -1170,6 +1235,17 @@ inline ObjectBulker<sai_next_hop_group_api_t>::ObjectBulker(SaiBulkerTraits<sai_
 {
     create_entries = api->create_next_hop_group_members;
     remove_entries = api->remove_next_hop_group_members;
+    // TODO: wait until available in SAI
+    //set_entries_attribute = ;
+}
+
+template <>
+inline ObjectBulker<sai_next_hop_api_t>::ObjectBulker(SaiBulkerTraits<sai_next_hop_api_t>::api_t *api, sai_object_id_t switch_id, size_t max_bulk_size) :
+    switch_id(switch_id),
+    max_bulk_size(max_bulk_size)
+{
+    create_entries = api->create_next_hops;
+    remove_entries = api->remove_next_hops;
     // TODO: wait until available in SAI
     //set_entries_attribute = ;
 }
