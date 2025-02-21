@@ -11,6 +11,7 @@
 #define SAI_SWITCH_ATTR_CUSTOM_RANGE_BASE SAI_SWITCH_ATTR_CUSTOM_RANGE_START
 #include "sairedis.h"
 #include "chassisorch.h"
+#include "stporch.h"
 
 using namespace std;
 using namespace swss;
@@ -19,8 +20,8 @@ using namespace swss;
 #define SELECT_TIMEOUT 1000
 #define PFC_WD_POLL_MSECS 100
 
-/* orchagent heart beat message interval */
-#define HEART_BEAT_INTERVAL_MSECS 10 * 1000
+#define APP_FABRIC_MONITOR_PORT_TABLE_NAME      "FABRIC_PORT_TABLE"
+#define APP_FABRIC_MONITOR_DATA_TABLE_NAME      "FABRIC_MONITOR_TABLE"
 
 extern sai_switch_api_t*           sai_switch_api;
 extern sai_object_id_t             gSwitchId;
@@ -60,6 +61,9 @@ Srv6Orch *gSrv6Orch;
 FlowCounterRouteOrch *gFlowCounterRouteOrch;
 DebugCounterOrch *gDebugCounterOrch;
 MonitorOrch *gMonitorOrch;
+TunnelDecapOrch *gTunneldecapOrch;
+StpOrch *gStpOrch;
+MuxOrch *gMuxOrch;
 
 bool gIsNatSupported = false;
 event_handle_t g_events_handle;
@@ -83,6 +87,16 @@ OrchDaemon::~OrchDaemon()
 {
     SWSS_LOG_ENTER();
 
+    // Stop the ring thread before delete orch pointers
+    if (ring_thread.joinable()) {
+        // notify the ring_thread to exit
+        gRingBuffer->thread_exited = true;
+        gRingBuffer->notify();
+        // wait for the ring_thread to exit
+        ring_thread.join();
+        disableRingBuffer();
+    }
+
     /*
      * Some orchagents call other agents in their destructor.
      * To avoid accessing deleted agent, do deletion in reverse order.
@@ -101,6 +115,48 @@ OrchDaemon::~OrchDaemon()
     events_deinit_publisher(g_events_handle);
 }
 
+void OrchDaemon::popRingBuffer()
+{
+    SWSS_LOG_ENTER();
+
+    // make sure there is only one thread created to run popRingBuffer()
+    if (!gRingBuffer || gRingBuffer->thread_created)
+        return;
+
+    gRingBuffer->thread_created = true;
+    SWSS_LOG_NOTICE("OrchDaemon starts the popRingBuffer thread!");
+
+    while (!gRingBuffer->thread_exited)
+    {
+        gRingBuffer->pauseThread();
+
+        gRingBuffer->setIdle(false);
+
+        AnyTask func;
+        while (gRingBuffer->pop(func)) {
+            func();
+        }
+
+        gRingBuffer->setIdle(true);
+    }
+}
+
+/**
+ * This function initializes gRingBuffer, otherwise it's nullptr.
+ */
+void OrchDaemon::enableRingBuffer() {
+    gRingBuffer = std::make_shared<RingBuffer>();
+    Executor::gRingBuffer = gRingBuffer;
+    Orch::gRingBuffer = gRingBuffer;
+    SWSS_LOG_NOTICE("RingBuffer created at %p!", (void *)gRingBuffer.get());
+}
+
+void OrchDaemon::disableRingBuffer() {
+    gRingBuffer = nullptr;
+    Executor::gRingBuffer = nullptr;
+    Orch::gRingBuffer = nullptr;
+}
+
 bool OrchDaemon::init()
 {
     SWSS_LOG_ENTER();
@@ -115,10 +171,12 @@ bool OrchDaemon::init()
     TableConnector app_switch_table(m_applDb, APP_SWITCH_TABLE_NAME);
     TableConnector conf_asic_sensors(m_configDb, CFG_ASIC_SENSORS_TABLE_NAME);
     TableConnector conf_switch_hash(m_configDb, CFG_SWITCH_HASH_TABLE_NAME);
+    TableConnector conf_suppress_asic_sdk_health_categories(m_configDb, CFG_SUPPRESS_ASIC_SDK_HEALTH_EVENT_NAME);
 
     vector<TableConnector> switch_tables = {
         conf_switch_hash,
         conf_asic_sensors,
+        conf_suppress_asic_sdk_health_categories,
         app_switch_table
     };
 
@@ -128,6 +186,7 @@ bool OrchDaemon::init()
 
     vector<table_name_with_pri_t> ports_tables = {
         { APP_PORT_TABLE_NAME,        portsorch_base_pri + 5 },
+        { APP_SEND_TO_INGRESS_PORT_TABLE_NAME,        portsorch_base_pri + 5 },
         { APP_VLAN_TABLE_NAME,        portsorch_base_pri + 2 },
         { APP_VLAN_MEMBER_TABLE_NAME, portsorch_base_pri     },
         { APP_LAG_TABLE_NAME,         portsorch_base_pri + 4 },
@@ -144,14 +203,28 @@ bool OrchDaemon::init()
     TableConnector stateDbFdb(m_stateDb, STATE_FDB_TABLE_NAME);
     TableConnector stateMclagDbFdb(m_stateDb, STATE_MCLAG_REMOTE_FDB_TABLE_NAME);
     gFdbOrch = new FdbOrch(m_applDb, app_fdb_tables, stateDbFdb, stateMclagDbFdb, gPortsOrch);
-    TableConnector stateDbBfdSessionTable(m_stateDb, STATE_BFD_SESSION_TABLE_NAME);
-    gBfdOrch = new BfdOrch(m_applDb, APP_BFD_SESSION_TABLE_NAME, stateDbBfdSessionTable);
 
+    TableConnector stateDbBfdSessionTable(m_stateDb, STATE_BFD_SESSION_TABLE_NAME);
+
+    BgpGlobalStateOrch* bgp_global_state_orch;
+    bgp_global_state_orch = new BgpGlobalStateOrch(m_configDb, CFG_BGP_DEVICE_GLOBAL_TABLE_NAME);
+    gDirectory.set(bgp_global_state_orch);
+
+    gBfdOrch = new BfdOrch(m_applDb, APP_BFD_SESSION_TABLE_NAME, stateDbBfdSessionTable);
+    gDirectory.set(gBfdOrch);
     static const  vector<string> route_pattern_tables = {
         CFG_FLOW_COUNTER_ROUTE_PATTERN_TABLE_NAME,
     };
     gFlowCounterRouteOrch = new FlowCounterRouteOrch(m_configDb, route_pattern_tables);
     gDirectory.set(gFlowCounterRouteOrch);
+
+    vector<string> stp_tables = {
+        APP_STP_VLAN_INSTANCE_TABLE_NAME,
+        APP_STP_PORT_STATE_TABLE_NAME,
+        APP_STP_FASTAGEING_FLUSH_TABLE_NAME
+    };
+    gStpOrch = new StpOrch(m_applDb, m_stateDb, stp_tables);
+    gDirectory.set(gStpOrch);
 
     vector<string> vnet_tables = {
             APP_VNET_RT_TABLE_NAME,
@@ -173,7 +246,7 @@ bool OrchDaemon::init()
     gDirectory.set(vnet_rt_orch);
     VRFOrch *vrf_orch = new VRFOrch(m_applDb, APP_VRF_TABLE_NAME, m_stateDb, STATE_VRF_OBJECT_TABLE_NAME);
     gDirectory.set(vrf_orch);
-    gMonitorOrch = new MonitorOrch(m_stateDb, STATE_VNET_MONITOR_TABLE_NAME); 
+    gMonitorOrch = new MonitorOrch(m_stateDb, STATE_VNET_MONITOR_TABLE_NAME);
     gDirectory.set(gMonitorOrch);
 
     const vector<string> chassis_frontend_tables = {
@@ -196,11 +269,19 @@ bool OrchDaemon::init()
     gFgNhgOrch = new FgNhgOrch(m_configDb, m_applDb, m_stateDb, fgnhg_tables, gNeighOrch, gIntfsOrch, vrf_orch);
     gDirectory.set(gFgNhgOrch);
 
-    vector<string> srv6_tables = {
-        APP_SRV6_SID_LIST_TABLE_NAME,
-        APP_SRV6_MY_SID_TABLE_NAME
+    TableConnector srv6_sid_list_table(m_applDb, APP_SRV6_SID_LIST_TABLE_NAME);
+    TableConnector srv6_my_sid_table(m_applDb, APP_SRV6_MY_SID_TABLE_NAME);
+    TableConnector pic_context_table(m_applDb, APP_PIC_CONTEXT_TABLE_NAME);
+    TableConnector srv6_my_sid_cfg_table(m_configDb, CFG_SRV6_MY_SID_TABLE_NAME);
+
+    vector<TableConnector> srv6_tables = {
+        srv6_sid_list_table,
+        srv6_my_sid_table,
+        pic_context_table,
+        srv6_my_sid_cfg_table
     };
-    gSrv6Orch = new Srv6Orch(m_applDb, srv6_tables, gSwitchOrch, vrf_orch, gNeighOrch);
+
+    gSrv6Orch = new Srv6Orch(m_configDb, m_applDb, srv6_tables, gSwitchOrch, vrf_orch, gNeighOrch);
     gDirectory.set(gSrv6Orch);
 
     const int routeorch_pri = 5;
@@ -213,7 +294,13 @@ bool OrchDaemon::init()
     gCbfNhgOrch = new CbfNhgOrch(m_applDb, APP_CLASS_BASED_NEXT_HOP_GROUP_TABLE_NAME);
 
     gCoppOrch = new CoppOrch(m_applDb, APP_COPP_TABLE_NAME);
-    TunnelDecapOrch *tunnel_decap_orch = new TunnelDecapOrch(m_applDb, APP_TUNNEL_DECAP_TABLE_NAME);
+
+    vector<string> tunnel_tables = {
+        APP_TUNNEL_DECAP_TABLE_NAME,
+        APP_TUNNEL_DECAP_TERM_TABLE_NAME
+    };
+    gTunneldecapOrch = new TunnelDecapOrch(m_applDb, m_stateDb, m_configDb, tunnel_tables);
+    gDirectory.set(gTunneldecapOrch);
 
     VxlanTunnelOrch *vxlan_tunnel_orch = new VxlanTunnelOrch(m_stateDb, m_applDb, APP_VXLAN_TUNNEL_TABLE_NAME);
     gDirectory.set(vxlan_tunnel_orch);
@@ -242,6 +329,7 @@ bool OrchDaemon::init()
         APP_DASH_APPLIANCE_TABLE_NAME,
         APP_DASH_ROUTING_TYPE_TABLE_NAME,
         APP_DASH_ENI_TABLE_NAME,
+        APP_DASH_ENI_ROUTE_TABLE_NAME,
         APP_DASH_QOS_TABLE_NAME
     };
 
@@ -250,13 +338,15 @@ bool OrchDaemon::init()
 
     vector<string> dash_route_tables = {
         APP_DASH_ROUTE_TABLE_NAME,
-        APP_DASH_ROUTE_RULE_TABLE_NAME
+        APP_DASH_ROUTE_RULE_TABLE_NAME,
+        APP_DASH_ROUTE_GROUP_TABLE_NAME
     };
 
     DashRouteOrch *dash_route_orch = new DashRouteOrch(m_applDb, dash_route_tables, dash_orch, m_zmqServer);
     gDirectory.set(dash_route_orch);
 
     vector<string> dash_acl_tables = {
+        APP_DASH_PREFIX_TAG_TABLE_NAME,
         APP_DASH_ACL_IN_TABLE_NAME,
         APP_DASH_ACL_OUT_TABLE_NAME,
         APP_DASH_ACL_GROUP_TABLE_NAME,
@@ -368,8 +458,8 @@ bool OrchDaemon::init()
         CFG_MUX_CABLE_TABLE_NAME,
         CFG_PEER_SWITCH_TABLE_NAME
     };
-    MuxOrch *mux_orch = new MuxOrch(m_configDb, mux_tables, tunnel_decap_orch, gNeighOrch, gFdbOrch);
-    gDirectory.set(mux_orch);
+    gMuxOrch = new MuxOrch(m_configDb, mux_tables, gTunneldecapOrch, gNeighOrch, gFdbOrch);
+    gDirectory.set(gMuxOrch);
 
     MuxCableOrch *mux_cb_orch = new MuxCableOrch(m_applDb, m_stateDb, APP_MUX_CABLE_TABLE_NAME);
     gDirectory.set(mux_cb_orch);
@@ -397,7 +487,7 @@ bool OrchDaemon::init()
      * when iterating ConsumerMap. This is ensured implicitly by the order of keys in ordered map.
      * For cases when Orch has to process tables in specific order, like PortsOrch during warm start, it has to override Orch::doTask()
      */
-    m_orchList = { gSwitchOrch, gCrmOrch, gPortsOrch, gBufferOrch, gFlowCounterRouteOrch, gIntfsOrch, gNeighOrch, gNhgMapOrch, gNhgOrch, gCbfNhgOrch, gRouteOrch, gCoppOrch, gQosOrch, wm_orch, gPolicerOrch, tunnel_decap_orch, sflow_orch, gDebugCounterOrch, gMacsecOrch, gBfdOrch, gSrv6Orch, mux_orch, mux_cb_orch, gMonitorOrch};
+    m_orchList = { gSwitchOrch, gCrmOrch, gPortsOrch, gBufferOrch, gFlowCounterRouteOrch, gIntfsOrch, gNeighOrch, gNhgMapOrch, gNhgOrch, gCbfNhgOrch, gRouteOrch, gCoppOrch, gQosOrch, wm_orch, gPolicerOrch, gTunneldecapOrch, sflow_orch, gDebugCounterOrch, gMacsecOrch, bgp_global_state_orch, gBfdOrch, gSrv6Orch, gMuxOrch, mux_cb_orch, gMonitorOrch, gStpOrch};
 
     bool initialize_dtel = false;
     if (platform == BFN_PLATFORM_SUBSTRING || platform == VS_PLATFORM_SUBSTRING)
@@ -505,8 +595,11 @@ bool OrchDaemon::init()
 
     if (m_fabricEnabled)
     {
+        // register APP_FABRIC_MONITOR_PORT_TABLE_NAME table
+        const int fabric_portsorch_base_pri = 30;
         vector<table_name_with_pri_t> fabric_port_tables = {
-           // empty for now
+           { APP_FABRIC_MONITOR_PORT_TABLE_NAME, fabric_portsorch_base_pri },
+           { APP_FABRIC_MONITOR_DATA_TABLE_NAME, fabric_portsorch_base_pri }
         };
         gFabricPortsOrch = new FabricPortsOrch(m_applDb, fabric_port_tables, m_fabricPortStatEnabled, m_fabricQueueStatEnabled);
         m_orchList.push_back(gFabricPortsOrch);
@@ -565,7 +658,8 @@ bool OrchDaemon::init()
                     queueAttrIds,
                     PFC_WD_POLL_MSECS));
     }
-    else if ((platform == INVM_PLATFORM_SUBSTRING)
+    else if ((platform == MRVL_TL_PLATFORM_SUBSTRING)
+	     || (platform == MRVL_PRST_PLATFORM_SUBSTRING)
              || (platform == BFN_PLATFORM_SUBSTRING)
              || (platform == NPS_PLATFORM_SUBSTRING))
     {
@@ -598,7 +692,9 @@ bool OrchDaemon::init()
 
         static const vector<sai_queue_attr_t> queueAttrIds;
 
-        if ((platform == INVM_PLATFORM_SUBSTRING) || (platform == NPS_PLATFORM_SUBSTRING))
+        if ((platform == MRVL_PRST_PLATFORM_SUBSTRING) ||
+	    (platform == MRVL_TL_PLATFORM_SUBSTRING) ||
+	    (platform == NPS_PLATFORM_SUBSTRING))
         {
             m_orchList.push_back(new PfcWdSwOrch<PfcWdZeroBufferHandler, PfcWdLossyHandler>(
                         m_configDb,
@@ -652,7 +748,25 @@ bool OrchDaemon::init()
             SAI_QUEUE_ATTR_PAUSE_STATUS,
         };
 
-        if(gSwitchOrch->checkPfcDlrInitEnable())
+        bool pfcDlrInit = gSwitchOrch->checkPfcDlrInitEnable();
+
+        // Override pfcDlrInit if needed, and this change is only for PFC tests.
+        if(getenv("PFC_DLR_INIT_ENABLE"))
+        {
+            string envPfcDlrInit = getenv("PFC_DLR_INIT_ENABLE");
+            if(envPfcDlrInit == "1")
+            {
+                pfcDlrInit = true;
+                SWSS_LOG_NOTICE("Override PfcDlrInitEnable to true");
+            }
+            else if(envPfcDlrInit == "0")
+            {
+                pfcDlrInit = false;
+                SWSS_LOG_NOTICE("Override PfcDlrInitEnable to false");
+            }
+        }
+
+        if(pfcDlrInit)
         {
             m_orchList.push_back(new PfcWdSwOrch<PfcWdDlrHandler, PfcWdDlrHandler>(
                         m_configDb,
@@ -674,7 +788,25 @@ bool OrchDaemon::init()
         }
     } else if (platform == CISCO_8000_PLATFORM_SUBSTRING)
     {
-        static const vector<sai_port_stat_t> portStatIds;
+        static const vector<sai_port_stat_t> portStatIds =
+        {
+            SAI_PORT_STAT_PFC_0_RX_PKTS,
+            SAI_PORT_STAT_PFC_1_RX_PKTS,
+            SAI_PORT_STAT_PFC_2_RX_PKTS,
+            SAI_PORT_STAT_PFC_3_RX_PKTS,
+            SAI_PORT_STAT_PFC_4_RX_PKTS,
+            SAI_PORT_STAT_PFC_5_RX_PKTS,
+            SAI_PORT_STAT_PFC_6_RX_PKTS,
+            SAI_PORT_STAT_PFC_7_RX_PKTS,
+            SAI_PORT_STAT_PFC_0_TX_PKTS,
+            SAI_PORT_STAT_PFC_1_TX_PKTS,
+            SAI_PORT_STAT_PFC_2_TX_PKTS,
+            SAI_PORT_STAT_PFC_3_TX_PKTS,
+            SAI_PORT_STAT_PFC_4_TX_PKTS,
+            SAI_PORT_STAT_PFC_5_TX_PKTS,
+            SAI_PORT_STAT_PFC_6_TX_PKTS,
+            SAI_PORT_STAT_PFC_7_TX_PKTS,
+        };
 
         static const vector<sai_queue_stat_t> queueStatIds =
         {
@@ -700,6 +832,11 @@ bool OrchDaemon::init()
     vector<string> p4rt_tables = {APP_P4RT_TABLE_NAME};
     gP4Orch = new P4Orch(m_applDb, p4rt_tables, vrf_orch, gCoppOrch);
     m_orchList.push_back(gP4Orch);
+
+    TableConnector confDbTwampTable(m_configDb, CFG_TWAMP_SESSION_TABLE_NAME);
+    TableConnector stateDbTwampTable(m_stateDb, STATE_TWAMP_SESSION_TABLE_NAME);
+    TwampOrch *twamp_orch = new TwampOrch(confDbTwampTable, stateDbTwampTable, gSwitchOrch, gPortsOrch, vrf_orch);
+    m_orchList.push_back(twamp_orch);
 
     if (WarmStart::isWarmStart())
     {
@@ -747,11 +884,13 @@ void OrchDaemon::logRotate() {
 }
 
 
-void OrchDaemon::start()
+void OrchDaemon::start(long heartBeatInterval)
 {
     SWSS_LOG_ENTER();
 
     Recorder::Instance().sairedis.setRotate(false);
+
+    ring_thread = std::thread(&OrchDaemon::popRingBuffer, this);
 
     for (Orch *o : m_orchList)
     {
@@ -768,7 +907,7 @@ void OrchDaemon::start()
         ret = m_select->select(&s, SELECT_TIMEOUT);
 
         auto tend = std::chrono::high_resolution_clock::now();
-        heartBeat(tend);
+        heartBeat(tend, heartBeatInterval);
 
         auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(tend - tstart);
 
@@ -793,6 +932,20 @@ void OrchDaemon::start()
              * requests live in it. When the daemon has nothing to do, it
              * is a good chance to flush the pipeline  */
             flush();
+
+            if (gRingBuffer)
+            {
+                if (!gRingBuffer->IsEmpty() || !gRingBuffer->IsIdle())
+                {
+                    gRingBuffer->notify();
+                }
+                else
+                {
+                    for (Orch *o : m_orchList)
+                        o->doTask();
+                }
+            }
+
             continue;
         }
 
@@ -810,10 +963,11 @@ void OrchDaemon::start()
         /* After each iteration, periodically check all m_toSync map to
          * execute all the remaining tasks that need to be retried. */
 
-        /* TODO: Abstract Orch class to have a specific todo list */
-        for (Orch *o : m_orchList)
-            o->doTask();
-
+        if (!gRingBuffer || (gRingBuffer->IsEmpty() && gRingBuffer->IsIdle()))
+        {
+            for (Orch *o : m_orchList)
+                o->doTask();
+        }
         /*
          * Asked to check warm restart readiness.
          * Not doing this under Select::TIMEOUT condition because of
@@ -825,6 +979,16 @@ void OrchDaemon::start()
             if (ret)
             {
                 // Orchagent is ready to perform warm restart, stop processing any new db data.
+                // but should finish data that already in the ring
+                if (gRingBuffer)
+                {
+                    while (!gRingBuffer->IsEmpty() || !gRingBuffer->IsIdle())
+                    {
+                        gRingBuffer->notify();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(SLEEP_MSECONDS));
+                    }
+                }
+
                 // Should sleep here or continue handling timers and etc.??
                 if (!gSwitchOrch->checkRestartNoFreeze())
                 {
@@ -845,7 +1009,7 @@ void OrchDaemon::start()
                     flush();
 
                     SWSS_LOG_WARN("Orchagent is frozen for warm restart!");
-                    sleep(UINT_MAX);
+                    freezeAndHeartBeat(UINT_MAX, heartBeatInterval);
                 }
             }
         }
@@ -864,6 +1028,10 @@ bool OrchDaemon::warmRestoreAndSyncUp()
     {
         o->bake();
     }
+
+    // let's cache the neighbor updates in mux orch and
+    // process them after everything being settled.
+    gMuxOrch->enableCachingNeighborUpdate();
 
     /*
      * Three iterations are needed.
@@ -890,6 +1058,9 @@ bool OrchDaemon::warmRestoreAndSyncUp()
             o->doTask();
         }
     }
+
+    gMuxOrch->updateCachedNeighbors();
+    gMuxOrch->disableCachingNeighborUpdate();
 
     // MirrorOrch depends on everything else being settled before it can run,
     // and mirror ACL rules depend on MirrorOrch, so run these two at the end
@@ -1002,15 +1173,34 @@ void OrchDaemon::addOrchList(Orch *o)
     m_orchList.push_back(o);
 }
 
-void OrchDaemon::heartBeat(std::chrono::time_point<std::chrono::high_resolution_clock> tcurrent)
+void OrchDaemon::heartBeat(std::chrono::time_point<std::chrono::high_resolution_clock> tcurrent, long interval)
 {
+    if (interval == 0)
+    {
+        // disable heart beat feature when interval is 0
+        return;
+    }
+
     // output heart beat message to SYSLOG
     auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(tcurrent - m_lastHeartBeat);
-    if (diff.count() >= HEART_BEAT_INTERVAL_MSECS)
+    if (diff.count() >= interval)
     {
         m_lastHeartBeat = tcurrent;
         // output heart beat message to supervisord with 'PROCESS_COMMUNICATION_STDOUT' event: http://supervisord.org/events.html
         cout << "<!--XSUPERVISOR:BEGIN-->heartbeat<!--XSUPERVISOR:END-->" << endl;
+    }
+}
+
+void OrchDaemon::freezeAndHeartBeat(unsigned int duration, long interval)
+{
+    while (duration > 0)
+    {
+        // Send heartbeat message to prevent Orchagent stuck alert.
+        auto tend = std::chrono::high_resolution_clock::now();
+        heartBeat(tend, interval);
+
+        duration--;
+        sleep(1);
     }
 }
 
@@ -1028,8 +1218,10 @@ bool FabricOrchDaemon::init()
     SWSS_LOG_ENTER();
     SWSS_LOG_NOTICE("FabricOrchDaemon init");
 
+    const int fabric_portsorch_base_pri = 30;
     vector<table_name_with_pri_t> fabric_port_tables = {
-        // empty for now, I don't consume anything yet
+        { APP_FABRIC_MONITOR_PORT_TABLE_NAME, fabric_portsorch_base_pri },
+        { APP_FABRIC_MONITOR_DATA_TABLE_NAME, fabric_portsorch_base_pri }
     };
     gFabricPortsOrch = new FabricPortsOrch(m_applDb, fabric_port_tables);
     addOrchList(gFabricPortsOrch);

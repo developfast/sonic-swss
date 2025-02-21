@@ -70,6 +70,7 @@ public:
     struct {
         sai_port_fec_mode_t value;
         bool is_set = false;
+        bool override_fec = false;
     } fec; // Port FEC
 
     struct {
@@ -154,6 +155,36 @@ public:
             bool is_set = false;
         } attn; // Port serdes attn
 
+        struct {
+            std::vector<std::uint32_t> value;
+            bool is_set = false;
+        } ob_m2lp; // Port serdes ob_m2lp
+
+        struct {
+            std::vector<std::uint32_t> value;
+            bool is_set = false;
+        } ob_alev_out; // Port serdes ob_alev_out
+
+        struct {
+            std::vector<std::uint32_t> value;
+            bool is_set = false;
+        } obplev; // Port serdes obplev
+
+        struct {
+            std::vector<std::uint32_t> value;
+            bool is_set = false;
+        } obnlev; // Port serdes obnlev
+
+        struct {
+            std::vector<std::uint32_t> value;
+            bool is_set = false;
+        } regn_bfm1p; // Port serdes regn_bfm1p
+
+        struct {
+            std::vector<std::uint32_t> value;
+            bool is_set = false;
+        } regn_bfm1n; // Port serdes regn_bfm1n
+
     } serdes; // Port serdes
 
     struct {
@@ -170,6 +201,55 @@ public:
         std::string value;
         bool is_set = false;
     } description; // Port description
+
+    struct {
+        std::string value;
+        bool is_set = false;
+    } subport; // Port subport
+
+    struct {
+        std::uint16_t value;
+        bool is_set = false;
+    } pt_intf_id; // Port interface ID for Path Tracing
+
+    struct {
+        sai_port_path_tracing_timestamp_type_t value;
+        bool is_set = false;
+    } pt_timestamp_template; // Port timestamp template for Path Tracing
+
+    struct {
+        sai_redis_link_event_damping_algorithm_t value;
+        bool is_set = false;
+    } link_event_damping_algorithm; // Port link event damping algorithm
+
+    struct {
+
+        struct {
+            uint32_t value;
+            bool is_set = false;
+        } max_suppress_time; // Max suppress time
+
+        struct {
+            uint32_t value;
+            bool is_set = false;
+        } decay_half_life; // Decay half life
+
+        struct {
+            uint32_t value;
+            bool is_set = false;
+        } suppress_threshold; // Suppress threshold
+
+        struct {
+            uint32_t value;
+            bool is_set = false;
+        } reuse_threshold; // Reuse threshold
+
+        struct {
+            uint32_t value;
+            bool is_set = false;
+        } flap_penalty; // Flap penalty
+
+    } link_event_damping_config; // Port link event damping config
 
     std::string key;
     std::string op;

@@ -4,11 +4,11 @@
 #include <gtest/gtest.h>
 
 #include <functional>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <unordered_map>
 
 #include "ipaddress.h"
-#include "json.hpp"
 #include "mock_response_publisher.h"
 #include "mock_sai_hostif.h"
 #include "mock_sai_next_hop.h"
@@ -258,6 +258,8 @@ class NextHopManagerTest : public ::testing::Test
         sai_next_hop_api->remove_next_hop = mock_remove_next_hop;
         sai_next_hop_api->set_next_hop_attribute = mock_set_next_hop_attribute;
         sai_next_hop_api->get_next_hop_attribute = mock_get_next_hop_attribute;
+        sai_next_hop_api->create_next_hops = mock_create_next_hops;
+        sai_next_hop_api->remove_next_hops = mock_remove_next_hops;
     }
 
     void TearDown() override

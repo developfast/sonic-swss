@@ -934,15 +934,6 @@ void BufferMgrDynamic::updateBufferObjectToDb(const string &key, const string &p
 void BufferMgrDynamic::updateBufferObjectListToDb(const string &key, const string &profileList, buffer_direction_t dir)
 {
     auto &table = m_applBufferProfileListTables[dir];
-    const auto &direction = m_bufferDirectionNames[dir];
-
-    if (!m_bufferPoolReady)
-    {
-        SWSS_LOG_NOTICE("Buffer pools are not ready when configuring buffer %s profile list %s, pending", direction.c_str(), key.c_str());
-        m_bufferObjectsPending = true;
-        return;
-    }
-
     vector<FieldValueTuple> fvVector;
 
     fvVector.emplace_back(buffer_profile_list_field_name, profileList);
@@ -1065,14 +1056,16 @@ bool BufferMgrDynamic::isHeadroomResourceValid(const string &port, const buffer_
 
     argv.emplace_back(profile.name);
     argv.emplace_back(profile.size);
+    argv.emplace_back(profile.xon);
+    argv.emplace_back(profile.xoff);
 
     if (!new_pg.empty())
     {
         argv.emplace_back(new_pg);
     }
 
-    SWSS_LOG_INFO("Checking headroom for port %s with profile %s size %s pg %s",
-                  port.c_str(), profile.name.c_str(), profile.size.c_str(), new_pg.c_str());
+    SWSS_LOG_INFO("Checking headroom for port %s with profile %s size %s xon %s xoff %s pg %s",
+                  port.c_str(), profile.name.c_str(), profile.size.c_str(), profile.xon.c_str(), profile.xoff.c_str(), new_pg.c_str());
 
     try
     {
@@ -3243,6 +3236,15 @@ task_process_status BufferMgrDynamic::handleSingleBufferPortProfileListEntry(con
                 SWSS_LOG_ERROR("Unknown field %s in %s", fvField(i).c_str(), key.c_str());
                 continue;
             }
+        }
+
+        if (!m_bufferPoolReady)
+        {
+            const auto &direction = m_bufferDirectionNames[dir];
+
+            SWSS_LOG_NOTICE("Buffer pools are not ready when configuring buffer %s profile list %s, pending", direction.c_str(), key.c_str());
+            m_bufferObjectsPending = true;
+            return task_process_status::task_success;
         }
 
         auto &portInfo = m_portInfoLookup[port];

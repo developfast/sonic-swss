@@ -331,6 +331,30 @@ class DVSAcl:
         for action in expected_action_list:
             assert action in action_list
     
+    def create_dscp_acl_rule(
+            self,
+            table_name: str,
+            rule_name: str,
+            qualifiers: Dict[str, str],
+            action: str,
+            priority: str = "2020"
+    ) -> None:
+        """Create a new DSCP ACL rule in the given table.
+        Args:
+            table_name: The name of the ACL table to add the rule to.
+            rule_name: The name of the ACL rule.
+            qualifiers: The list of qualifiers to add to the rule.
+            action: DSCP value.
+            priority: The priority of the rule.
+        """
+        fvs = {
+            "priority": priority,
+            "DSCP_ACTION": action
+        }
+
+        for k, v in qualifiers.items():
+            fvs[k] = v
+        self.config_db.create_entry("ACL_RULE", "{}|{}".format(table_name, rule_name), fvs)
             
     def create_acl_rule(
             self,
@@ -599,7 +623,7 @@ class DVSAcl:
             elif k == "SAI_ACL_ENTRY_ATTR_ADMIN_STATE":
                 assert v == "true"
             elif k in sai_qualifiers:
-                assert sai_qualifiers[k](v)
+                assert sai_qualifiers[k](v), "Unexpected value for SAI qualifier: key={}, value={}".format(k, v)
             else:
                 assert False, "Unknown SAI qualifier: key={}, value={}".format(k, v)
 
@@ -685,6 +709,17 @@ class DVSAcl:
             return True
 
         return _match_acl_range
+    
+    def get_acl_counter_oid(self, acl_rule_id=None) -> str:
+        if not acl_rule_id:
+            acl_rule_id = self._get_acl_rule_id()
+        
+        entry = self.asic_db.wait_for_entry("ASIC_STATE:SAI_OBJECT_TYPE_ACL_ENTRY", acl_rule_id)
+        counter_oid = entry.get("SAI_ACL_ENTRY_ATTR_ACTION_COUNTER")
+        return counter_oid
+    
+    def get_acl_rule_id(self) -> str:
+        return self._get_acl_rule_id()
 
     def _get_acl_rule_id(self) -> str:
         num_keys = len(self.asic_db.default_acl_entries) + 1
@@ -742,7 +777,12 @@ class DVSAcl:
             return
         rule_to_counter_map = self.counters_db.get_entry("ACL_COUNTER_RULE_MAP", "")
         counter_to_rule_map = {v: k for k, v in rule_to_counter_map.items()}
-        assert counter_oid in counter_to_rule_map
+        assert counter_oid in counter_to_rule_map       
+
+    def check_acl_counter_not_in_counters_map(self, acl_counter_oid: str):
+        rule_to_counter_map = self.counters_db.get_entry("ACL_COUNTER_RULE_MAP", "")
+        counter_to_rule_map = {v: k for k, v in rule_to_counter_map.items()}
+        assert acl_counter_oid not in counter_to_rule_map
 
     def verify_acl_table_status(
             self,
